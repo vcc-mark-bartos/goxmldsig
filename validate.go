@@ -196,25 +196,55 @@ func (ctx *ValidationContext) verifySignedInfo(sig *types.Signature, canonicaliz
 }
 
 func (ctx *ValidationContext) validateSignature(el *etree.Element, sig *types.Signature, cert *x509.Certificate) (*etree.Element, error) {
-	idAttr := el.SelectAttr(ctx.IdAttribute)
-	if idAttr == nil || idAttr.Value == "" {
-		return nil, errors.New("Missing ID attribute")
+	refID := ""
+	if sig.Object != nil {
+		refID = sig.Object.ID
+	} else {
+		idAttr := el.SelectAttr(ctx.IdAttribute)
+		if idAttr == nil || idAttr.Value == "" {
+			return nil, errors.New("Missing ID attribute")
+		}
+		refID = idAttr.Value
 	}
 
 	var ref *types.Reference
 
 	// Find the first reference which references the top-level element
 	for _, _ref := range sig.SignedInfo.References {
-		if _ref.URI == "" || _ref.URI[1:] == idAttr.Value {
+		if _ref.URI == "" || _ref.URI[1:] == refID {
 			ref = &_ref
 		}
 	}
 
-	// Perform all transformations listed in the 'SignedInfo'
-	// Basically, this means removing the 'SignedInfo'
-	transformed, canonicalizer, err := ctx.transform(el, sig, ref)
-	if err != nil {
-		return nil, err
+	var transformed *etree.Element
+	var canonicalizer Canonicalizer
+	var err error
+	if sig.Object != nil {
+		objectElement := sig.UnderlyingElement().FindElement("Object")
+		transformed = objectElement
+		if transformed == nil {
+			return nil, errors.New("Error implementing etree")
+		}
+		switch AlgorithmID(sig.SignedInfo.CanonicalizationMethod.Algorithm) {
+		case CanonicalXML11AlgorithmId:
+			canonicalizer = MakeC14N11Canonicalizer()
+			break
+		case CanonicalXML10RecAlgorithmId:
+			canonicalizer = MakeC14N10RecCanonicalizer()
+			break
+		case CanonicalXML10CommentAlgorithmId:
+			canonicalizer = MakeC14N10CommentCanonicalizer()
+			break
+		default:
+			return nil, errors.New("Unknown algorithm")
+		}
+	} else {
+		// Perform all transformations listed in the 'SignedInfo'
+		// Basically, this means removing the 'SignedInfo'
+		transformed, canonicalizer, err = ctx.transform(el, sig, ref)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	digestAlgorithm := ref.DigestAlgo.Algorithm
@@ -261,12 +291,8 @@ func contains(roots []*x509.Certificate, cert *x509.Certificate) bool {
 
 // findSignature searches for a Signature element referencing the passed root element.
 func (ctx *ValidationContext) findSignature(el *etree.Element) (*types.Signature, error) {
-	idAttr := el.SelectAttr(ctx.IdAttribute)
-	if idAttr == nil || idAttr.Value == "" {
-		return nil, errors.New("Missing ID attribute")
-	}
-
 	var sig *types.Signature
+	outerCtx := ctx
 
 	// Traverse the tree looking for a Signature element
 	err := etreeutils.NSFindIterate(el, Namespace, SignatureTag, func(ctx etreeutils.NSContext, el *etree.Element) error {
@@ -341,12 +367,25 @@ func (ctx *ValidationContext) findSignature(el *etree.Element) (*types.Signature
 			return err
 		}
 
-		// Traverse references in the signature to determine whether it has at least
-		// one reference to the top level element. If so, conclude the search.
-		for _, ref := range _sig.SignedInfo.References {
-			if ref.URI == "" || ref.URI[1:] == idAttr.Value {
-				sig = _sig
-				return etreeutils.ErrTraversalHalted
+		if _sig.Object != nil { // enveloping signature
+			objectID := _sig.Object.ID
+			// Traverse references in the signature to determine whether is has at least
+			// one reference to the Object element. If so, conclude the search
+			for _, ref := range _sig.SignedInfo.References {
+				if ref.URI == "" || ref.URI[1:] == objectID {
+					sig = _sig
+					return etreeutils.ErrTraversalHalted
+				}
+			}
+		} else {
+			idAttr := el.SelectAttr(outerCtx.IdAttribute)
+			// Traverse references in the signature to determine whether it has at least
+			// one reference to the top level element. If so, conclude the search.
+			for _, ref := range _sig.SignedInfo.References {
+				if ref.URI == "" || ref.URI[1:] == idAttr.Value {
+					sig = _sig
+					return etreeutils.ErrTraversalHalted
+				}
 			}
 		}
 
@@ -411,6 +450,89 @@ func (ctx *ValidationContext) verifyCertificate(sig *types.Signature) (*x509.Cer
 	return cert, nil
 }
 
+// validates the certificate chain and returns the leaf certificate
+func (ctx *ValidationContext) verifyCertificateChain(sig *types.Signature) ([]*x509.Certificate, error) {
+	now := ctx.Clock.Now()
+
+	roots, err := ctx.CertificateStore.Certificates()
+	if err != nil {
+		return nil, err
+	}
+
+	var leafCert *x509.Certificate
+	chain := []*x509.Certificate{}
+
+	if sig.KeyInfo != nil {
+		certificates := sig.KeyInfo.X509Data.X509Certificates
+		// If the Signature includes KeyInfo, extract the certificate from there
+		if len(certificates) == 0 || sig.KeyInfo.X509Data.X509Certificates[0].Data == "" {
+			return nil, errors.New("missing X509Certificate within KeyInfo")
+		}
+		// parse all certificates
+		certs := []*x509.Certificate{}
+		var rootCert *x509.Certificate
+		for _, c := range certificates {
+			certData, err := base64.StdEncoding.DecodeString(
+				whiteSpace.ReplaceAllString(c.Data, ""))
+			if err != nil {
+				return nil, errors.New("Failed to parse certificate")
+			}
+
+			cert, err := x509.ParseCertificate(certData)
+			if err != nil {
+				return nil, err
+			}
+			certs = append(certs, cert)
+			// set cert as root cert if in the root cert list
+			if contains(roots, cert) {
+				rootCert = cert
+			}
+		}
+		if rootCert == nil {
+			return nil, errors.New("Failed to find a root cert")
+		}
+		currentCert := rootCert
+		chain = append(chain, currentCert)
+		for i := 0; i < len(certs)-1; i++ {
+			// find cert signed by currentCert
+			cert := certs[i]
+			if bytes.Equal(cert.AuthorityKeyId, currentCert.SubjectKeyId) {
+				certPool := x509.NewCertPool()
+				certPool.AddCert(currentCert)
+				verifiedChain, err := cert.Verify(x509.VerifyOptions{
+					Roots: certPool,
+				})
+				if err != nil {
+					return nil, err
+				}
+				if len(verifiedChain) < 1 || len(verifiedChain[0]) < 2 {
+					return nil, errors.New("Certificate cannot be verified")
+				}
+				firstChain := verifiedChain[0]
+				if !(firstChain[1].Equal(currentCert)) {
+					return nil, errors.New("Certificate not in valid certificate chain")
+				}
+				currentCert = cert
+				chain = append(chain, currentCert)
+			}
+		}
+		leafCert = currentCert
+	} else {
+		// If the Signature doesn't have KeyInfo, Use the root certificate if there is only one
+		if len(roots) == 1 {
+			leafCert = roots[0]
+		} else {
+			return nil, errors.New("Missing x509 Element")
+		}
+	}
+
+	if now.Before(leafCert.NotBefore) || now.After(leafCert.NotAfter) {
+		return nil, errors.New("Cert is not valid at this time")
+	}
+
+	return chain, nil
+}
+
 // Validate verifies that the passed element contains a valid enveloped signature
 // matching a currently-valid certificate in the context's CertificateStore.
 func (ctx *ValidationContext) Validate(el *etree.Element) (*etree.Element, error) {
@@ -428,4 +550,24 @@ func (ctx *ValidationContext) Validate(el *etree.Element) (*etree.Element, error
 	}
 
 	return ctx.validateSignature(el, sig, cert)
+}
+
+// ValidateSignature validates the signature in `el` and returns the validated element as well as the certificate
+// that signed the signature.
+func (ctx *ValidationContext) ValidateSignature(el *etree.Element) (*etree.Element, []*x509.Certificate, error) {
+	// Make a copy of the element to avoid mutating the one we were passed.
+	el = el.Copy()
+
+	sig, err := ctx.findSignature(el)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	certs, err := ctx.verifyCertificateChain(sig)
+	if err != nil {
+		return nil, nil, err
+	}
+	leafCert := certs[len(certs)-1]
+	validatedElement, err := ctx.validateSignature(el, sig, leafCert)
+	return validatedElement, certs, err
 }
