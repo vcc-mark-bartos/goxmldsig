@@ -572,7 +572,7 @@ func (ctx *ValidationContext) Validate(el *etree.Element) (*etree.Element, error
 }
 
 // ValidateSignature validates the signature in `el` and returns the validated element as well as the certificate
-// chain that signed the signature.
+// chain that validates the element. The last certificate in the chain signed the validated element.
 func (ctx *ValidationContext) ValidateSignature(el *etree.Element) (*etree.Element, []*x509.Certificate, error) {
 	// Make a copy of the element to avoid mutating the one we were passed.
 	el = el.Copy()
