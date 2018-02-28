@@ -451,7 +451,7 @@ func (ctx *ValidationContext) verifyCertificate(sig *types.Signature) (*x509.Cer
 }
 
 // validates the certificate chain and returns the leaf certificate
-func (ctx *ValidationContext) verifyCertificateChain(sig *types.Signature) ([]*x509.Certificate, error) {
+func (ctx *ValidationContext) verifyCertificateChain(sig *types.Signature) ([][]*x509.Certificate, error) {
 	now := ctx.Clock.Now()
 
 	roots, err := ctx.CertificateStore.Certificates()
@@ -459,18 +459,20 @@ func (ctx *ValidationContext) verifyCertificateChain(sig *types.Signature) ([]*x
 		return nil, err
 	}
 
-	var leafCert *x509.Certificate
-	chain := []*x509.Certificate{}
-
+	chains := [][]*x509.Certificate{}
+	// create a chain for each root
+	for _, root := range roots {
+		chains = append(chains, []*x509.Certificate{root})
+	}
 	if sig.KeyInfo != nil {
 		certificates := sig.KeyInfo.X509Data.X509Certificates
 		// If the Signature includes KeyInfo, extract the certificate from there
 		if len(certificates) == 0 || sig.KeyInfo.X509Data.X509Certificates[0].Data == "" {
 			return nil, errors.New("missing X509Certificate within KeyInfo")
 		}
-		// parse all certificates
+		// parse all certificates (skip root certs)
 		certs := []*x509.Certificate{}
-		var rootCert *x509.Certificate
+		// var rootCert *x509.Certificate
 		for _, c := range certificates {
 			certData, err := base64.StdEncoding.DecodeString(
 				whiteSpace.ReplaceAllString(c.Data, ""))
@@ -482,55 +484,72 @@ func (ctx *ValidationContext) verifyCertificateChain(sig *types.Signature) ([]*x
 			if err != nil {
 				return nil, err
 			}
-			certs = append(certs, cert)
-			// set cert as root cert if in the root cert list
-			if contains(roots, cert) {
-				rootCert = cert
+
+			// skip root certs
+			if !contains(roots, cert) {
+				// skip old cert since it is not valid anylonger
+				if !(now.Before(cert.NotBefore) || now.After(cert.NotAfter)) {
+					// skip self signed certs
+					if !bytes.Equal(cert.AuthorityKeyId, cert.SubjectKeyId) {
+						certs = append(certs, cert)
+					}
+				}
 			}
 		}
-		if rootCert == nil {
-			return nil, errors.New("Failed to find a root cert")
-		}
-		currentCert := rootCert
-		chain = append(chain, currentCert)
-		for i := 0; i < len(certs)-1; i++ {
-			// find cert signed by currentCert
-			cert := certs[i]
-			if bytes.Equal(cert.AuthorityKeyId, currentCert.SubjectKeyId) {
-				certPool := x509.NewCertPool()
-				certPool.AddCert(currentCert)
-				verifiedChain, err := cert.Verify(x509.VerifyOptions{
-					Roots: certPool,
-				})
-				if err != nil {
-					return nil, err
+		changed := true
+		for changed {
+			changed = false
+			// keep list of not processed certs
+			newCerts := []*x509.Certificate{}
+			// for each non-root cert
+			for _, cert := range certs {
+
+				processed := false
+				// copy list of certificate chains since it might be altered in the loop below
+				newChains := chains[:]
+				for _, chain := range chains {
+					leafCertInChain := chain[len(chain)-1]
+					// check if AuthorityKeyId matches any leaf cert in any cert chain
+					if bytes.Equal(cert.AuthorityKeyId, leafCertInChain.SubjectKeyId) {
+						// create cert pool of current leaf cert
+						certPool := x509.NewCertPool()
+						certPool.AddCert(leafCertInChain)
+						verifiedChain, err := cert.Verify(x509.VerifyOptions{
+							Roots: certPool,
+						})
+						if err != nil {
+							return nil, err
+						}
+						if len(verifiedChain) < 1 || len(verifiedChain[0]) < 2 {
+							return nil, errors.New("Certificate cannot be verified")
+						}
+						firstChain := verifiedChain[0]
+						if !(firstChain[0].Equal(cert)) {
+							return nil, errors.New("Certificate not in valid certificate chain")
+						}
+						newChain := append(chain, cert)
+						newChains = append(newChains, newChain)
+						// certificate is processed - should not be processed another time
+						processed = true
+						// new certificate chain in created
+						changed = true
+					}
 				}
-				if len(verifiedChain) < 1 || len(verifiedChain[0]) < 2 {
-					return nil, errors.New("Certificate cannot be verified")
+				// if cert is not added to any certificate chain - try to process is another time
+				if !processed {
+					newCerts = append(newCerts, cert)
 				}
-				firstChain := verifiedChain[0]
-				if !(firstChain[1].Equal(currentCert)) {
-					return nil, errors.New("Certificate not in valid certificate chain")
-				}
-				currentCert = cert
-				chain = append(chain, currentCert)
+				chains = newChains
 			}
+			certs = newCerts
 		}
-		leafCert = currentCert
 	} else {
-		// If the Signature doesn't have KeyInfo, Use the root certificate if there is only one
-		if len(roots) == 1 {
-			leafCert = roots[0]
-		} else {
+		if len(roots) == 0 {
 			return nil, errors.New("Missing x509 Element")
 		}
 	}
 
-	if now.Before(leafCert.NotBefore) || now.After(leafCert.NotAfter) {
-		return nil, errors.New("Cert is not valid at this time")
-	}
-
-	return chain, nil
+	return chains, nil
 }
 
 // Validate verifies that the passed element contains a valid enveloped signature
@@ -553,21 +572,32 @@ func (ctx *ValidationContext) Validate(el *etree.Element) (*etree.Element, error
 }
 
 // ValidateSignature validates the signature in `el` and returns the validated element as well as the certificate
-// that signed the signature.
+// chain that signed the signature.
 func (ctx *ValidationContext) ValidateSignature(el *etree.Element) (*etree.Element, []*x509.Certificate, error) {
 	// Make a copy of the element to avoid mutating the one we were passed.
 	el = el.Copy()
 
 	sig, err := ctx.findSignature(el)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.New("error finding signature, err: " + err.Error())
 	}
 
-	certs, err := ctx.verifyCertificateChain(sig)
+	certificateChains, err := ctx.verifyCertificateChain(sig)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.New("error verifying certificate chain, err: " + err.Error())
 	}
-	leafCert := certs[len(certs)-1]
-	validatedElement, err := ctx.validateSignature(el, sig, leafCert)
-	return validatedElement, certs, err
+	// try to find out which certificate chain that signed
+	var validatedElement *etree.Element
+	signatureChain := []*x509.Certificate{}
+	for _, chain := range certificateChains {
+		leafCert := chain[len(chain)-1]
+		validatedElement, err = ctx.validateSignature(el, sig, leafCert)
+		if err == nil {
+			// found valid chain
+			signatureChain = chain
+			break
+		}
+	}
+
+	return validatedElement, signatureChain, err
 }
