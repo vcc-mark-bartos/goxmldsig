@@ -290,12 +290,12 @@ func contains(roots []*x509.Certificate, cert *x509.Certificate) bool {
 }
 
 // findSignature searches for a Signature element referencing the passed root element.
-func (ctx *ValidationContext) findSignature(el *etree.Element) (*types.Signature, error) {
+func (ctx *ValidationContext) findSignature(rootEl *etree.Element) (*types.Signature, error) {
 	var sig *types.Signature
 	outerCtx := ctx
 
 	// Traverse the tree looking for a Signature element
-	err := etreeutils.NSFindIterate(el, Namespace, SignatureTag, func(ctx etreeutils.NSContext, el *etree.Element) error {
+	err := etreeutils.NSFindIterate(rootEl, Namespace, SignatureTag, func(ctx etreeutils.NSContext, el *etree.Element) error {
 
 		found := false
 		err := etreeutils.NSFindIterateCtx(ctx, el, Namespace, SignedInfoTag,
@@ -378,13 +378,15 @@ func (ctx *ValidationContext) findSignature(el *etree.Element) (*types.Signature
 				}
 			}
 		} else {
-			idAttr := el.SelectAttr(outerCtx.IdAttribute)
-			// Traverse references in the signature to determine whether it has at least
-			// one reference to the top level element. If so, conclude the search.
-			for _, ref := range _sig.SignedInfo.References {
-				if ref.URI == "" || ref.URI[1:] == idAttr.Value {
-					sig = _sig
-					return etreeutils.ErrTraversalHalted
+			idAttr := rootEl.SelectAttr(outerCtx.IdAttribute)
+			if idAttr != nil {
+				// Traverse references in the signature to determine whether it has at least
+				// one reference to the top level element. If so, conclude the search.
+				for _, ref := range _sig.SignedInfo.References {
+					if ref.URI == "" || ref.URI[1:] == idAttr.Value {
+						sig = _sig
+						return etreeutils.ErrTraversalHalted
+					}
 				}
 			}
 		}
