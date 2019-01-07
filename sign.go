@@ -10,8 +10,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/vcc-mark-bartos/goxmldsig/etreeutils"
+
 	"github.com/beevik/etree"
-	"github.com/russellhaering/goxmldsig/etreeutils"
 )
 
 type SigningContext struct {
